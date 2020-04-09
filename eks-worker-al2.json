@@ -11,8 +11,8 @@
     "aws_session_token": "{{env `AWS_SESSION_TOKEN`}}",
 
     "binary_bucket_name": "amazon-eks",
-    "binary_bucket_region": "us-east-1",
-    "kubernetes_version": 1.15,
+    "binary_bucket_region": "us-west-2",
+    "kubernetes_version": "1.15",
     "kubernetes_build_date": null,
     "docker_version": "18.09.9ce-2.amzn2",
     "cni_version": "v0.6.0",
