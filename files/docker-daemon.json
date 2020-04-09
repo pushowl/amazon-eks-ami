@@ -6,5 +6,6 @@
     "max-file": "10"
   },
   "live-restore": true,
-  "max-concurrent-downloads": 10
+  "max-concurrent-downloads": 10,
+  "default-ulimits": {"nofile": {"Name": "nofile", "Hard": 150000, "Soft": 150000}}
 }
