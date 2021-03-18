@@ -7,5 +7,16 @@
   },
   "live-restore": true,
   "max-concurrent-downloads": 10,
-  "default-ulimits": {"nofile": {"Name": "nofile", "Hard": 150000, "Soft": 150000}}
+  "default-ulimits": {
+    "nofile": {
+      "Name": "nofile", 
+      "Hard": 150000, 
+      "Soft": 150000
+    },
+    "memlock": {
+      "Name": "memlock",
+      "Hard": -1,
+      "Soft": -1
+    }
+  }
 }
