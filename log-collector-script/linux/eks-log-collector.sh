@@ -20,12 +20,13 @@ export LANG="C"
 export LC_ALL="C"
 
 # Global options
-readonly PROGRAM_VERSION="0.6.1"
+readonly PROGRAM_VERSION="0.6.2"
 readonly PROGRAM_SOURCE="https://github.com/awslabs/amazon-eks-ami/blob/master/log-collector-script/"
 readonly PROGRAM_NAME="$(basename "$0" .sh)"
 readonly PROGRAM_DIR="/opt/log-collector"
 readonly LOG_DIR="/var/log"
-readonly COLLECT_DIR="/tmp/${PROGRAM_NAME}"
+readonly COLLECT_DIR="/tmp/eks-log-collector"
+readonly CURRENT_TIME=$(date --utc +%Y-%m-%d_%H%M-%Z)
 readonly DAYS_10=$(date -d "-10 days" '+%Y-%m-%d %H:%M')
 INSTANCE_ID=""
 INIT_TYPE=""
@@ -53,6 +54,7 @@ COMMON_DIRECTORIES=(
   kernel
   system
   docker
+  containerd
   storage
   var_log
   networking
@@ -187,9 +189,20 @@ create_directories() {
   done
 }
 
-get_instance_metadata() {
-  readonly INSTANCE_ID=$(curl --max-time 3 --silent http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null)
-  echo "${INSTANCE_ID}" > "${COLLECT_DIR}"/system/instance-id.txt
+get_instance_id() {
+  INSTANCE_ID_FILE="/var/lib/cloud/data/instance-id"
+
+  if grep -q '^i-' "$INSTANCE_ID_FILE"; then
+    cp ${INSTANCE_ID_FILE} "${COLLECT_DIR}"/system/instance-id.txt
+    readonly INSTANCE_ID=$(cat "${COLLECT_DIR}"/system/instance-id.txt)
+  else
+    readonly INSTANCE_ID=$(curl --max-time 10 --retry 5 http://169.254.169.254/latest/meta-data/instance-id)
+    if [ 0 -eq $? ]; then # Check if previous command was successful.
+      echo "${INSTANCE_ID}" > "${COLLECT_DIR}"/system/instance-id.txt
+    else
+      warning "Unable to find EC2 Instance Id. Skipped Instance Id."
+    fi
+  fi
 }
 
 is_diskfull() {
@@ -207,7 +220,12 @@ is_diskfull() {
 }
 
 cleanup() {
-  rm --recursive --force "${COLLECT_DIR}" >/dev/null 2>&1
+  #guard rails to avoid accidental deletion of unknown data
+  if [[ "${COLLECT_DIR}" == "/tmp/eks-log-collector" ]]; then
+    rm --recursive --force "${COLLECT_DIR}" >/dev/null 2>&1
+  else
+    echo "Unable to Cleanup as {COLLECT_DIR} variable is modified. Please cleanup manually!"
+  fi
 }
 
 init() {
@@ -224,7 +242,7 @@ init() {
 collect() {
   init
   is_diskfull
-  get_instance_metadata
+  get_instance_id
   get_common_logs
   get_kernel_info
   get_mounts_info
@@ -232,6 +250,7 @@ collect() {
   get_iptables_info
   get_pkglist
   get_system_services
+  get_containerd_info
   get_docker_info
   get_k8s_info
   get_ipamd_info
@@ -244,14 +263,14 @@ collect() {
 pack() {
   try "archive gathered information"
 
-  tar --create --verbose --gzip --file "${LOG_DIR}"/eks_"${INSTANCE_ID}"_"$(date --utc +%Y-%m-%d_%H%M-%Z)"_"${PROGRAM_VERSION}".tar.gz --directory="${COLLECT_DIR}" . > /dev/null 2>&1
+  tar --create --verbose --gzip --file "${LOG_DIR}"/eks_"${INSTANCE_ID}"_"${CURRENT_TIME}"_"${PROGRAM_VERSION}".tar.gz --directory="${COLLECT_DIR}" . > /dev/null 2>&1
 
   ok
 }
 
 finished() {
   cleanup
-  echo -e "\n\tDone... your bundled logs are located in ${LOG_DIR}/eks_${INSTANCE_ID}_$(date --utc +%Y-%m-%d_%H%M-%Z)_${PROGRAM_VERSION}.tar.gz\n"
+  echo -e "\n\tDone... your bundled logs are located in ${LOG_DIR}/eks_${INSTANCE_ID}_${CURRENT_TIME}_${PROGRAM_VERSION}.tar.gz\n"
 }
 
 get_mounts_info() {
@@ -282,10 +301,10 @@ get_selinux_info() {
 get_iptables_info() {
   try "collect iptables information"
 
-  iptables --wait 1 --numeric --verbose --list --table mangle > "${COLLECT_DIR}"/networking/iptables-mangle.txt
-  iptables --wait 1 --numeric --verbose --list --table filter > "${COLLECT_DIR}"/networking/iptables-filter.txt
-  iptables --wait 1 --numeric --verbose --list --table nat > "${COLLECT_DIR}"/networking/iptables-nat.txt
-  iptables --wait 1 --numeric --verbose --list > "${COLLECT_DIR}"/networking/iptables.txt
+  iptables --wait 1 --numeric --verbose --list --table mangle | tee "${COLLECT_DIR}"/networking/iptables-mangle.txt | sed '/^num\|^$\|^Chain\|^\ pkts.*.destination/d' | echo -e "=======\nTotal Number of Rules: $(wc -l)" >> "${COLLECT_DIR}"/networking/iptables-mangle.txt
+  iptables --wait 1 --numeric --verbose --list --table filter | tee "${COLLECT_DIR}"/networking/iptables-filter.txt | sed '/^num\|^$\|^Chain\|^\ pkts.*.destination/d' | echo -e "=======\nTotal Number of Rules: $(wc -l)" >> "${COLLECT_DIR}"/networking/iptables-filter.txt
+  iptables --wait 1 --numeric --verbose --list --table nat | tee "${COLLECT_DIR}"/networking/iptables-nat.txt | sed '/^num\|^$\|^Chain\|^\ pkts.*.destination/d' | echo -e "=======\nTotal Number of Rules: $(wc -l)" >> "${COLLECT_DIR}"/networking/iptables-nat.txt
+  iptables --wait 1 --numeric --verbose --list | tee "${COLLECT_DIR}"/networking/iptables.txt | sed '/^num\|^$\|^Chain\|^\ pkts.*.destination/d' | echo -e "=======\nTotal Number of Rules: $(wc -l)" >> "${COLLECT_DIR}"/networking/iptables.txt
   iptables-save > "${COLLECT_DIR}"/networking/iptables-save.txt
 
   ok
@@ -301,17 +320,17 @@ get_common_logs() {
           continue
         fi
         if [[ "${entry}" == "containers" ]]; then
-          cp --force --recursive /var/log/containers/aws-node* "${COLLECT_DIR}"/var_log/ 2>/dev/null
-          cp --force --recursive /var/log/containers/kube-system_cni-metrics-helper* "${COLLECT_DIR}"/var_log/ 2>/dev/null
-          cp --force --recursive /var/log/containers/coredns-* "${COLLECT_DIR}"/var_log/ 2>/dev/null
-          cp --force --recursive /var/log/containers/kube-proxy* "${COLLECT_DIR}"/var_log/ 2>/dev/null
+          cp --force --dereference --recursive /var/log/containers/aws-node* "${COLLECT_DIR}"/var_log/ 2>/dev/null
+          cp --force --dereference --recursive /var/log/containers/kube-system_cni-metrics-helper* "${COLLECT_DIR}"/var_log/ 2>/dev/null
+          cp --force --dereference --recursive /var/log/containers/coredns-* "${COLLECT_DIR}"/var_log/ 2>/dev/null
+          cp --force --dereference --recursive /var/log/containers/kube-proxy* "${COLLECT_DIR}"/var_log/ 2>/dev/null
           continue
         fi
         if [[ "${entry}" == "pods" ]]; then
-          cp --force --recursive /var/log/pods/kube-system_aws-node* "${COLLECT_DIR}"/var_log/ 2>/dev/null
-          cp --force --recursive /var/log/pods/kube-system_cni-metrics-helper* "${COLLECT_DIR}"/var_log/ 2>/dev/null
-          cp --force --recursive /var/log/pods/kube-system_coredns* "${COLLECT_DIR}"/var_log/ 2>/dev/null
-          cp --force --recursive /var/log/pods/kube-system_kube-proxy* "${COLLECT_DIR}"/var_log/ 2>/dev/null
+          cp --force --dereference --recursive /var/log/pods/kube-system_aws-node* "${COLLECT_DIR}"/var_log/ 2>/dev/null
+          cp --force --dereference --recursive /var/log/pods/kube-system_cni-metrics-helper* "${COLLECT_DIR}"/var_log/ 2>/dev/null
+          cp --force --dereference --recursive /var/log/pods/kube-system_coredns* "${COLLECT_DIR}"/var_log/ 2>/dev/null
+          cp --force --dereference --recursive /var/log/pods/kube-system_kube-proxy* "${COLLECT_DIR}"/var_log/ 2>/dev/null
           continue
         fi
       cp --force --recursive --dereference /var/log/"${entry}" "${COLLECT_DIR}"/var_log/ 2>/dev/null
@@ -377,7 +396,7 @@ get_k8s_info() {
     KUBECONFIG="/var/lib/kubelet/kubeconfig"
     command -v kubectl > /dev/null && kubectl get --kubeconfig=${KUBECONFIG} svc > "${COLLECT_DIR}"/kubelet/svc.log
     command -v kubectl > /dev/null && kubectl --kubeconfig=${KUBECONFIG} config view  --output yaml > "${COLLECT_DIR}"/kubelet/kubeconfig.yaml
-  
+
   else
     echo "======== Unable to find KUBECONFIG, IGNORING POD DATA =========" >> "${COLLECT_DIR}"/kubelet/svc.log
   fi
@@ -406,9 +425,9 @@ get_k8s_info() {
 
 get_ipamd_info() {
   if [[ "${ignore_introspection}" == "false" ]]; then
-    try "collect L-IPAMD introspectioon information"
+    try "collect L-IPAMD introspection information"
     for entry in ${IPAMD_DATA[*]}; do
-      curl --max-time 3 --silent http://localhost:61679/v1/"${entry}" >> "${COLLECT_DIR}"/ipamd/"${entry}".txt
+      curl --max-time 3 --silent http://localhost:61679/v1/"${entry}" >> "${COLLECT_DIR}"/ipamd/"${entry}".json
     done
   else
     echo "Ignoring IPAM introspection stats as mentioned"| tee -a "${COLLECT_DIR}"/ipamd/ipam_introspection_ignore.txt
@@ -416,10 +435,13 @@ get_ipamd_info() {
 
   if [[ "${ignore_metrics}" == "false" ]]; then
     try "collect L-IPAMD prometheus metrics"
-    curl --max-time 3 --silent http://localhost:61678/metrics > "${COLLECT_DIR}"/ipamd/metrics.txt 2>&1
+    curl --max-time 3 --silent http://localhost:61678/metrics > "${COLLECT_DIR}"/ipamd/metrics.json 2>&1
   else
     echo "Ignoring Prometheus Metrics collection as mentioned"| tee -a "${COLLECT_DIR}"/ipamd/ipam_metrics_ignore.txt
   fi
+
+  try "collect L-IPAMD checkpoint"
+  cp /var/run/aws-node/ipam.json "${COLLECT_DIR}"/ipamd/ipam.json
 
   ok
 }
@@ -435,12 +457,21 @@ get_sysctls_info() {
 get_networking_info() {
   try "collect networking infomation"
 
+  # conntrack info
+  echo "*** Output of conntrack -S *** " >> "${COLLECT_DIR}"/networking/conntrack.txt
+  timeout 75 conntrack -S >> "${COLLECT_DIR}"/networking/conntrack.txt
+  echo "*** Output of conntrack -L ***" >> "${COLLECT_DIR}"/networking/conntrack.txt
+  timeout 75 conntrack -L >> "${COLLECT_DIR}"/networking/conntrack.txt
+
   # ifconfig
   timeout 75 ifconfig > "${COLLECT_DIR}"/networking/ifconfig.txt
 
   # ip rule show
   timeout 75 ip rule show > "${COLLECT_DIR}"/networking/iprule.txt
   timeout 75 ip route show table all >> "${COLLECT_DIR}"/networking/iproute.txt
+
+  # configure-multicard-interfaces
+  timeout 75 journalctl -u configure-multicard-interfaces > "${COLLECT_DIR}"/networking/configure-multicard-interfaces.txt || echo -e "\tTimed out, ignoring \"configure-multicard-interfaces unit output \" "
 
   ok
 }
@@ -507,6 +538,19 @@ get_system_services() {
   ok
 }
 
+get_containerd_info() {
+    try "Collect Containerd daemon information"
+
+    if [[ "$(pgrep -o containerd)" -ne 0 ]]; then
+        timeout 75 containerd config dump > "${COLLECT_DIR}"/containerd/containerd-config.txt 2>&1 || echo -e "\tTimed out, ignoring \"containerd info output \" "
+        timeout 75 journalctl -u containerd > "${COLLECT_DIR}"/containerd/containerd-log.txt 2>&1 || echo -e "\tTimed out, ignoring \"containerd info output \" "
+    else
+        warning "The Containerd daemon is not running."
+    fi
+
+   ok
+}
+
 get_docker_info() {
   try "collect Docker daemon information"
 
@@ -515,6 +559,7 @@ get_docker_info() {
     timeout 75 docker ps --all --no-trunc > "${COLLECT_DIR}"/docker/docker-ps.txt 2>&1 || echo -e "\tTimed out, ignoring \"docker ps --all --no-truc output \" "
     timeout 75 docker images > "${COLLECT_DIR}"/docker/docker-images.txt 2>&1 || echo -e "\tTimed out, ignoring \"docker images output \" "
     timeout 75 docker version > "${COLLECT_DIR}"/docker/docker-version.txt 2>&1 || echo -e "\tTimed out, ignoring \"docker version output \" "
+    timeout 75 curl --unix-socket /var/run/docker.sock http://./debug/pprof/goroutine\?debug\=2 > "${COLLECT_DIR}"/docker/docker-trace.txt 2>&1 || echo -e "\tTimed out, ignoring \"docker version output \" "
   else
     warning "The Docker daemon is not running."
   fi
